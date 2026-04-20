@@ -3,53 +3,46 @@
 #include <linux/init.h>
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
-#include <linux/skbudd.h>
+#include <linux/skbuff.h>
 #include <linux/proc_fs.h>
 #include <linux/inet.h>
 #include <linux/ip.h>
 #include <linux/icmp.h>
 #include <linux/if_arp.h>
 
+MODULE_AUTHOR("leshii517");
+MODULE_DESCRIPTION("Виртуальный интерфейс с заданием IP через procfs");
 
-static struct net_device *virtnet_dev;
+static struct net_device *vping_dev;
 static struct proc_dir_entry *proc_dir;
 static struct proc_dir_entry *proc_ip_file;
 
+static __be32 vping_ip = 0;   
 
-static __be32 virtual_ip = 0; // переменная для определения ip 
+/* ====================== PROCFS ====================== */
 
+static ssize_t vping_ip_read(struct file *file, char __user *buf,
+                             size_t count, loff_t *pos)
+{
+    char tmp[32];
+    int len;
 
-// функция чтения из /proc
-static ssize_t virtual_ip_read(struct file *file, char __user *buf, size_t count, loff_t *pos){
-    char buf[32];
-    int length_ip;
+    if (*pos > 0)
+        return 0;
 
-    length_ip = sprintf(buf, sizeof(tmp), "%pI4\n", &virtual_ip);
+    len = snprintf(tmp, sizeof(tmp), "%pI4\n", &vping_ip);
+    if (count < len)
+        return -EINVAL;
 
-    *pos = length_ip;
+    if (copy_to_user(buf, tmp, len))
+        return -EFAULT;
 
-    return length_ip;
-
+    *pos = len;
+    return len;
 }
 
-static ssize_t virtual_ip_write(struct file *file, char __user *buf, size_t count, loff_t *pos){
-
-    char buf[16];
-    __be32 new_ip;
-
-    buf[count] = '\0';
-
-    virtual_ip = new_ip;
-
-    printk(KERNEL_INFO "IP изменен на %pI4\n", &virtual_ip);
-
-    return count;
-
-
-}
-
-static netdev_tx_t vping_push_pull_packege(struct sk_buff * skb,struct net_device *dev){
-
+static ssize_t vping_ip_write(struct file *file, const char __user *buf,
+                              size_t count, loff_t *pos)
 {
     char tmp[16];
     __be32 new_ip;
@@ -76,6 +69,8 @@ static const struct proc_ops vping_ip_fops = {
     .proc_write = vping_ip_write,
 };
 
+/* ====================== XMIT (основная функция) ====================== */
+
 static netdev_tx_t vping_xmit(struct sk_buff *skb, struct net_device *dev)
 {
     struct ethhdr *eth = eth_hdr(skb);
@@ -83,12 +78,10 @@ static netdev_tx_t vping_xmit(struct sk_buff *skb, struct net_device *dev)
     dev->stats.tx_packets++;
     dev->stats.tx_bytes += skb->len;
 
-    if (vping_ip == 0) {
-        /* IP ещё не задан */
+    if (vping_ip == 0)
         goto drop;
-    }
 
-    /* === ARP === */
+    /* ARP Reply */
     if (skb->protocol == htons(ETH_P_ARP)) {
         struct arphdr *arp = arp_hdr(skb);
         unsigned char *arp_ptr = (unsigned char *)(arp + 1);
@@ -96,43 +89,36 @@ static netdev_tx_t vping_xmit(struct sk_buff *skb, struct net_device *dev)
         __be32 *tip = (__be32 *)(arp_ptr + 2 * ETH_ALEN + 4);
 
         if (arp->ar_op == htons(ARPOP_REQUEST) && *tip == vping_ip) {
-            /* Строим ARP Reply */
             arp->ar_op = htons(ARPOP_REPLY);
 
-            /* MAC */
-            memcpy(arp_ptr + ETH_ALEN, arp_ptr, ETH_ALEN);           /* target MAC = sender MAC */
-            memcpy(arp_ptr, dev->dev_addr, ETH_ALEN);                /* sender MAC = наш MAC */
+            memcpy(arp_ptr + ETH_ALEN, arp_ptr, ETH_ALEN);
+            memcpy(arp_ptr, dev->dev_addr, ETH_ALEN);
 
-            /* IP */
             *tip = *sip;
             *sip = vping_ip;
 
-            /* Ethernet */
             memcpy(eth->h_dest, eth->h_source, ETH_ALEN);
             memcpy(eth->h_source, dev->dev_addr, ETH_ALEN);
 
             goto rx_back;
         }
     }
-
-    /* === ICMP Echo Request === */
+    /* ICMP Echo Reply */
     else if (skb->protocol == htons(ETH_P_IP)) {
         struct iphdr *iph = ip_hdr(skb);
         if (iph->protocol == IPPROTO_ICMP) {
             struct icmphdr *icmph = icmp_hdr(skb);
 
             if (icmph->type == ICMP_ECHO && iph->daddr == vping_ip) {
-                /* Строим Echo Reply */
-                __be32 tmp = iph->saddr;
+                __be32 tmp_addr = iph->saddr;
                 iph->saddr = iph->daddr;
-                iph->daddr = tmp;
+                iph->daddr = tmp_addr;
 
                 icmph->type = ICMP_ECHOREPLY;
                 icmph->checksum = 0;
                 icmph->checksum = ip_compute_csum((unsigned char *)icmph,
                                                   skb->len - (iph->ihl << 2));
 
-                /* Ethernet */
                 memcpy(eth->h_dest, eth->h_source, ETH_ALEN);
                 memcpy(eth->h_source, dev->dev_addr, ETH_ALEN);
 
@@ -146,7 +132,6 @@ drop:
     return NETDEV_TX_OK;
 
 rx_back:
-    /* Возвращаем пакет в стек как входящий */
     skb->pkt_type = PACKET_HOST;
     skb->ip_summed = CHECKSUM_UNNECESSARY;
 
@@ -157,20 +142,18 @@ rx_back:
     return NETDEV_TX_OK;
 }
 
-
-static int vping_open(struct net_device *dev){
-
-    netinf_start_queue( net_device );
+static int vping_open(struct net_device *dev)
+{
+    netif_start_queue(dev);
+    printk(KERN_INFO "vping: %s opened\n", dev->name);
     return 0;
-
 }
 
-
-static int vping_close(struct net_device *dev){
-
-    netinf_stop_queue(net_device);
+static int vping_stop(struct net_device *dev)
+{
+    netif_stop_queue(dev);
+    printk(KERN_INFO "vping: %s stopped\n", dev->name);
     return 0;
-
 }
 
 static const struct net_device_ops vping_netdev_ops = {
@@ -178,6 +161,8 @@ static const struct net_device_ops vping_netdev_ops = {
     .ndo_stop       = vping_stop,
     .ndo_start_xmit = vping_xmit,
 };
+
+/* ====================== INIT / EXIT ====================== */
 
 static int __init vping_init(void)
 {
@@ -195,12 +180,13 @@ static int __init vping_init(void)
         return -EIO;
     }
 
-    /* procfs */
+    /* Создаём /proc/vping/ip */
     proc_dir = proc_mkdir("vping", NULL);
     if (proc_dir)
         proc_ip_file = proc_create("ip", 0644, proc_dir, &vping_ip_fops);
 
-
+    printk(KERN_INFO "vping: модуль загружен. Интерфейс %s создан.\n"
+           "       echo \"192.168.123.1\" > /proc/vping/ip\n", vping_dev->name);
 
     return 0;
 }
@@ -214,7 +200,9 @@ static void __exit vping_exit(void)
 
     unregister_netdev(vping_dev);
     free_netdev(vping_dev);
+
+    printk(KERN_INFO "vping: модуль выгружен\n");
 }
 
 module_init(vping_init);
-
+module_exit(vping_exit);
