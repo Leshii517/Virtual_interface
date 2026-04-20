@@ -10,6 +10,7 @@
 #include <linux/icmp.h>
 #include <linux/if_arp.h>
 
+MODULE_LICENSE("GPL");
 MODULE_AUTHOR("leshii517");
 MODULE_DESCRIPTION("Виртуальный интерфейс с заданием IP через procfs");
 
